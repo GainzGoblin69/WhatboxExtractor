@@ -77,6 +77,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("delete_after", false)
         set(v) = sp.edit().putBoolean("delete_after", v).apply()
 
+    /** Favorite folders, in the order they were added. */
+    var favorites: List<String>
+        get() = (sp.getString("favorites", "") ?: "").split("\n").filter { it.isNotBlank() }
+        set(v) = sp.edit().putString("favorites", v.joinToString("\n")).apply()
+
     /** Extraction that was running when the app was closed: "jobDir\nfolder\nfileName". */
     var activeJob: String?
         get() = sp.getString("active_job", null)

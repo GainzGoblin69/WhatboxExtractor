@@ -9,6 +9,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,11 +28,17 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -65,6 +73,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -113,6 +123,8 @@ fun App(vm: MainViewModel = viewModel()) {
     }
 
     vm.confirm?.let { ExtractDialog(vm, it) }
+    if (vm.showExtractOptions) ExtractOptionsDialog(vm)
+    if (vm.showNewFolder) NewFolderDialog(vm)
     vm.job?.let { if (!it.hidden) JobDialog(vm, it) }
 }
 
@@ -155,12 +167,22 @@ fun BrowserScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
                     }
                 },
                 actions = {
+                    FavoritesMenu(vm)
                     IconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
-                    IconButton(onClick = { vm.screen = Screen.SETTINGS }) { Icon(Icons.Filled.Settings, "Settings") }
+                    IconButton(onClick = { vm.showExtractOptions = true }) { Icon(Icons.Filled.Settings, "Settings") }
                 },
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },
+        floatingActionButton = {
+            if (vm.path.isNotEmpty() && vm.error == null) {
+                ExtendedFloatingActionButton(
+                    onClick = { vm.showNewFolder = true },
+                    icon = { Icon(Icons.Filled.Add, contentDescription = null) },
+                    text = { Text("New folder") },
+                )
+            }
+        },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
             vm.update?.let { UpdateBanner(vm, it) }
@@ -180,7 +202,7 @@ fun BrowserScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
                 Text("This folder is empty", Modifier.padding(24.dp))
             }
 
-            LazyColumn(Modifier.fillMaxSize()) {
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
                 items(vm.files, key = { it.path }) { f -> FileRow(f) { vm.open(f) } }
             }
         }
@@ -256,6 +278,112 @@ fun JobBanner(vm: MainViewModel, j: JobState) {
             overflow = TextOverflow.Ellipsis,
         )
     }
+}
+
+val FavoriteGold = Color(0xFFFFC107)
+
+/** Star button: add/remove the current folder, and jump to any favorite. */
+@Composable
+fun FavoritesMenu(vm: MainViewModel) {
+    var open by remember { mutableStateOf(false) }
+    val isFav = vm.path in vm.favorites
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(
+                Icons.Filled.Star,
+                contentDescription = "Favorites",
+                tint = if (isFav) FavoriteGold else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+            )
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            if (vm.path.isNotEmpty()) {
+                DropdownMenuItem(
+                    text = { Text(if (isFav) "Remove this folder from favorites" else "Add this folder to favorites") },
+                    leadingIcon = {
+                        Icon(Icons.Filled.Star, null, tint = if (isFav) MaterialTheme.colorScheme.onSurfaceVariant else FavoriteGold)
+                    },
+                    onClick = {
+                        open = false
+                        vm.toggleFavorite()
+                    },
+                )
+                HorizontalDivider()
+            }
+            if (vm.favorites.isEmpty()) {
+                DropdownMenuItem(text = { Text("No favorites yet") }, onClick = { open = false }, enabled = false)
+            } else {
+                Text(
+                    "Favorites",
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                )
+                vm.favorites.forEach { fav ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(favoriteName(fav, vm.homePath), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(fav, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        },
+                        leadingIcon = { Text("📁") },
+                        onClick = {
+                            open = false
+                            vm.openFavorite(fav)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+fun favoriteName(path: String, home: String?): String = when {
+    path == home -> "Home"
+    path == "/" -> "/"
+    else -> path.substringAfterLast('/')
+}
+
+/** Opened from the cog while browsing. */
+@Composable
+fun ExtractOptionsDialog(vm: MainViewModel) {
+    AlertDialog(
+        onDismissRequest = { vm.showExtractOptions = false },
+        title = { Text("Extraction options") },
+        text = {
+            Column {
+                CheckRow("Put files in a new folder named after the archive", vm.intoFolder) { vm.setIntoFolderDefault(it) }
+                CheckRow("Delete the archive after it extracts successfully", vm.deleteAfter) { vm.setDeleteAfterDefault(it) }
+                Spacer(Modifier.size(8.dp))
+                TextButton(onClick = {
+                    vm.showExtractOptions = false
+                    vm.screen = Screen.SETTINGS
+                }) { Text("Connection settings & favorites…") }
+            }
+        },
+        confirmButton = { Button(onClick = { vm.showExtractOptions = false }) { Text("Done") } },
+    )
+}
+
+@Composable
+fun NewFolderDialog(vm: MainViewModel) {
+    var name by rememberSaveable { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = { vm.showNewFolder = false },
+        title = { Text("New folder") },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text("Folder name") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { vm.createFolder(name) }),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = { Button(onClick = { vm.createFolder(name) }, enabled = name.isNotBlank()) { Text("Create") } },
+        dismissButton = { TextButton(onClick = { vm.showNewFolder = false }) { Text("Cancel") } },
+    )
 }
 
 @Composable
@@ -460,6 +588,30 @@ fun SettingsScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
                 "Your login is stored encrypted on this phone only.",
                 style = MaterialTheme.typography.bodySmall,
             )
+
+            HorizontalDivider()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Star, null, tint = FavoriteGold)
+                Spacer(Modifier.width(8.dp))
+                Text("Favorites", style = MaterialTheme.typography.titleSmall)
+            }
+            if (vm.favorites.isEmpty()) {
+                Text(
+                    "Tap the ★ in the toolbar while in a folder to add it here.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            vm.favorites.forEach { fav ->
+                ListItem(
+                    headlineContent = { Text(favoriteName(fav, vm.homePath), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    supportingContent = { Text(fav, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    leadingContent = { Text("📁", fontSize = 22.sp) },
+                    trailingContent = {
+                        IconButton(onClick = { vm.removeFavorite(fav) }) { Icon(Icons.Filled.Close, "Remove favorite") }
+                    },
+                    modifier = Modifier.clickable(enabled = c.isComplete) { vm.openFavorite(fav) },
+                )
+            }
 
             HorizontalDivider()
             Text("Extraction defaults", style = MaterialTheme.typography.titleSmall)

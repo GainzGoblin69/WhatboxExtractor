@@ -53,6 +53,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var updateProgress by mutableStateOf<Float?>(null)
         private set
+    var favorites by mutableStateOf(prefs.favorites)
+        private set
+    var showExtractOptions by mutableStateOf(false)
+    var showNewFolder by mutableStateOf(false)
     var intoFolder by mutableStateOf(prefs.intoFolder)
     var deleteAfter by mutableStateOf(prefs.deleteAfter)
 
@@ -107,6 +111,54 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 message = "That's one piece of a multi-part archive. Tap the .part1.rar file to extract all parts."
             else -> message = "Only .zip, .rar and .7z files can be extracted."
         }
+    }
+
+    fun createFolder(name: String) {
+        val n = name.trim()
+        when {
+            n.isEmpty() -> { message = "Enter a folder name."; return }
+            n.contains('/') || n == "." || n == ".." -> { message = "Folder names can't contain \"/\"."; return }
+            files.any { it.name == n } -> { message = "\"$n\" already exists here."; return }
+        }
+        showNewFolder = false
+        val cfg = config
+        val dir = path
+        viewModelScope.launch {
+            try {
+                ssh.use(cfg) { ch -> ch.mkdir(SshClient.joinPath(dir, n)) }
+                message = "Created folder \"$n\""
+                if (path == dir) load(dir)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                message = "Couldn't create folder: ${friendlyError(e)}"
+            }
+        }
+    }
+
+    // ---------- Favorites ----------
+
+    fun toggleFavorite() {
+        val p = path
+        if (p.isEmpty()) return
+        if (p in favorites) {
+            favorites = favorites - p
+            message = "Removed from favorites"
+        } else {
+            favorites = favorites + p
+            message = "Added to favorites"
+        }
+        prefs.favorites = favorites
+    }
+
+    fun removeFavorite(p: String) {
+        favorites = favorites - p
+        prefs.favorites = favorites
+    }
+
+    fun openFavorite(p: String) {
+        screen = Screen.BROWSER
+        load(p)
     }
 
     // ---------- Settings ----------
