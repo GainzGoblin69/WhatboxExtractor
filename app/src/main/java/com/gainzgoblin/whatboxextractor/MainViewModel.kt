@@ -48,6 +48,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var message by mutableStateOf<String?>(null)
     var confirm by mutableStateOf<List<RemoteFile>?>(null)
     var pendingDelete by mutableStateOf<List<RemoteFile>?>(null)
+        private set
+    var torrentMatches by mutableStateOf<List<TorrentMatch>>(emptyList())
+        private set
+    var torrentChecking by mutableStateOf(false)
+        private set
+    var torrentError by mutableStateOf<String?>(null)
+        private set
+    var removeTorrents by mutableStateOf(true)
+    private var lookupJob: Job? = null
     var deleting by mutableStateOf(false)
         private set
     var selected by mutableStateOf<Set<String>>(emptySet())
@@ -114,7 +123,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             selected.isNotEmpty() -> toggleSelect(f)
             f.isDir -> load(f.path)
             Archives.kind(f.name) != null -> confirm = listOf(f)
-            else -> pendingDelete = listOf(f)
+            else -> requestDelete(listOf(f))
         }
     }
 
@@ -146,7 +155,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteSelected() {
         val items = selectedFiles
-        if (items.isNotEmpty()) pendingDelete = items
+        if (items.isNotEmpty()) requestDelete(items)
+    }
+
+    /** Opens the delete box and checks in the background whether rTorrent is seeding any of it. */
+    fun requestDelete(items: List<RemoteFile>) {
+        pendingDelete = items
+        torrentMatches = emptyList()
+        torrentError = null
+        removeTorrents = true
+        val cfg = config
+        lookupJob?.cancel()
+        lookupJob = viewModelScope.launch {
+            torrentChecking = true
+            try {
+                val home = ssh.home
+                ssh.exec(cfg, "mkdir -p ${shQuote(home.trimEnd('/') + "/.whatbox-extractor")}")
+                ssh.writeFile(cfg, Torrents.helperPath(home), Torrents.HELPER_SCRIPT)
+                val r = ssh.exec(cfg, Torrents.findCommand(home, items.map { it.path }))
+                torrentMatches = Torrents.parse(r.out, r.err)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                torrentError = e.message ?: "Couldn't check rTorrent"
+            } finally {
+                torrentChecking = false
+            }
+        }
+    }
+
+    fun cancelDelete() {
+        lookupJob?.cancel()
+        torrentChecking = false
+        pendingDelete = null
     }
 
     fun confirmDelete() {
@@ -159,10 +200,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // Only delete things directly inside the folder being viewed.
                 val targets = items.filter { it.path.startsWith(dir.trimEnd('/') + "/") && it.path != dir }
                 if (targets.isEmpty()) return@launch
+                var torrentNote = ""
+                val torrents = torrentMatches
+                if (removeTorrents && torrents.isNotEmpty()) {
+                    // Remove from rTorrent first so it doesn't complain about missing files.
+                    try {
+                        val r = ssh.exec(cfg, Torrents.removeCommand(ssh.home, torrents.map { it.hash }))
+                        Torrents.parse(r.out, r.err)
+                        torrentNote = if (torrents.size == 1) " and removed the torrent" else " and removed ${torrents.size} torrents"
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        torrentNote = " (couldn't remove torrent: ${e.message})"
+                    }
+                }
                 val cmd = "rm -rf -- " + targets.joinToString(" ") { shQuote(it.path) }
                 val r = ssh.exec(cfg, cmd)
                 if (r.code != 0) throw IllegalStateException(r.err.trim().ifBlank { "rm failed (code ${r.code})" })
-                message = if (targets.size == 1) "Deleted ${targets[0].name}" else "Deleted ${targets.size} items"
+                message = (if (targets.size == 1) "Deleted ${targets[0].name}" else "Deleted ${targets.size} items") + torrentNote
                 prefs.favorites.let { favs ->
                     val gone = favs.filter { fav -> targets.any { t -> fav == t.path || fav.startsWith(t.path + "/") } }
                     if (gone.isNotEmpty()) {

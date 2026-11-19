@@ -301,7 +301,7 @@ fun SelectionBar(vm: MainViewModel) {
 fun DeleteDialog(vm: MainViewModel, items: List<RemoteFile>) {
     val folders = items.count { it.isDir }
     AlertDialog(
-        onDismissRequest = { if (!vm.deleting) vm.pendingDelete = null },
+        onDismissRequest = { if (!vm.deleting) vm.cancelDelete() },
         title = {
             Text(
                 when {
@@ -331,6 +331,43 @@ fun DeleteDialog(vm: MainViewModel, items: List<RemoteFile>) {
                     )
                 }
                 Text("This can't be undone.", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.size(8.dp))
+                val torrents = vm.torrentMatches
+                val tErr = vm.torrentError
+                when {
+                    vm.torrentChecking -> Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Checking rTorrent…", style = MaterialTheme.typography.bodySmall)
+                    }
+                    torrents.isNotEmpty() -> {
+                        val label = if (torrents.size == 1) "Also remove the torrent from rTorrent"
+                        else "Also remove ${torrents.size} torrents from rTorrent"
+                        CheckRow(label, vm.removeTorrents) { vm.removeTorrents = it }
+                        torrents.take(4).forEach {
+                            Text(
+                                "🧲 " + it.name,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(start = 12.dp),
+                            )
+                        }
+                        if (torrents.size > 4) {
+                            Text("…and ${torrents.size - 4} more", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 12.dp))
+                        }
+                    }
+                    tErr != null -> Text(
+                        "Couldn't check rTorrent: $tErr",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    else -> Text(
+                        "Not part of any torrent in rTorrent.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 if (vm.deleting) {
                     Spacer(Modifier.size(8.dp))
                     LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -340,7 +377,7 @@ fun DeleteDialog(vm: MainViewModel, items: List<RemoteFile>) {
         confirmButton = {
             Button(
                 onClick = { vm.confirmDelete() },
-                enabled = !vm.deleting,
+                enabled = !vm.deleting && !vm.torrentChecking,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError,
@@ -348,7 +385,7 @@ fun DeleteDialog(vm: MainViewModel, items: List<RemoteFile>) {
             ) { Text("Delete") }
         },
         dismissButton = {
-            TextButton(onClick = { vm.pendingDelete = null }, enabled = !vm.deleting) { Text("Cancel") }
+            TextButton(onClick = { vm.cancelDelete() }, enabled = !vm.deleting) { Text("Cancel") }
         },
     )
 }
@@ -528,7 +565,7 @@ fun ExtractDialog(vm: MainViewModel, list: List<RemoteFile>) {
                 if (single != null) {
                     TextButton(onClick = {
                         vm.confirm = null
-                        vm.pendingDelete = list
+                        vm.requestDelete(list)
                     }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
                 }
                 TextButton(onClick = { vm.confirm = null }) { Text("Cancel") }
