@@ -46,7 +46,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var error by mutableStateOf<String?>(null)
         private set
     var message by mutableStateOf<String?>(null)
-    var confirm by mutableStateOf<RemoteFile?>(null)
+    var confirm by mutableStateOf<List<RemoteFile>?>(null)
+    var pendingDelete by mutableStateOf<List<RemoteFile>?>(null)
+    var deleting by mutableStateOf(false)
+        private set
+    var selected by mutableStateOf<Set<String>>(emptySet())
+        private set
     var job by mutableStateOf<JobState?>(null)
         private set
     var update by mutableStateOf<UpdateInfo?>(null)
@@ -78,6 +83,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun load(target: String) {
         val cfg = config
         loadJob?.cancel()
+        selected = emptySet()
         loadJob = viewModelScope.launch {
             loading = true
             error = null
@@ -105,11 +111,74 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun open(f: RemoteFile) {
         when {
+            selected.isNotEmpty() -> toggleSelect(f)
             f.isDir -> load(f.path)
-            Archives.kind(f.name) != null -> confirm = f
-            Archives.isLaterPart(f.name) ->
-                message = "That's one piece of a multi-part archive. Tap the .part1.rar file to extract all parts."
-            else -> message = "Only .zip, .rar and .7z files can be extracted."
+            Archives.kind(f.name) != null -> confirm = listOf(f)
+            else -> pendingDelete = listOf(f)
+        }
+    }
+
+    // ---------- Selection & delete ----------
+
+    val selectedFiles: List<RemoteFile>
+        get() = files.filter { it.path in selected }
+
+    fun toggleSelect(f: RemoteFile) {
+        selected = if (f.path in selected) selected - f.path else selected + f.path
+    }
+
+    fun selectAll() {
+        selected = if (selected.size == files.size) emptySet() else files.map { it.path }.toSet()
+    }
+
+    fun clearSelection() {
+        selected = emptySet()
+    }
+
+    fun extractSelected() {
+        val archives = selectedFiles.filter { !it.isDir && Archives.kind(it.name) != null }
+        if (archives.isEmpty()) {
+            message = "None of the selected items are .zip, .rar or .7z archives."
+            return
+        }
+        confirm = archives
+    }
+
+    fun deleteSelected() {
+        val items = selectedFiles
+        if (items.isNotEmpty()) pendingDelete = items
+    }
+
+    fun confirmDelete() {
+        val items = pendingDelete ?: return
+        val cfg = config
+        val dir = path
+        viewModelScope.launch {
+            deleting = true
+            try {
+                // Only delete things directly inside the folder being viewed.
+                val targets = items.filter { it.path.startsWith(dir.trimEnd('/') + "/") && it.path != dir }
+                if (targets.isEmpty()) return@launch
+                val cmd = "rm -rf -- " + targets.joinToString(" ") { shQuote(it.path) }
+                val r = ssh.exec(cfg, cmd)
+                if (r.code != 0) throw IllegalStateException(r.err.trim().ifBlank { "rm failed (code ${r.code})" })
+                message = if (targets.size == 1) "Deleted ${targets[0].name}" else "Deleted ${targets.size} items"
+                prefs.favorites.let { favs ->
+                    val gone = favs.filter { fav -> targets.any { t -> fav == t.path || fav.startsWith(t.path + "/") } }
+                    if (gone.isNotEmpty()) {
+                        favorites = favs - gone.toSet()
+                        prefs.favorites = favorites
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                message = "Delete failed: ${friendlyError(e)}"
+            } finally {
+                deleting = false
+                pendingDelete = null
+                if (path == dir) load(dir)
+            }
         }
     }
 
@@ -207,31 +276,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- Extraction ----------
 
-    fun startExtract(f: RemoteFile) {
+    fun startExtract(list: List<RemoteFile>) {
         confirm = null
+        clearSelection()
         if (job?.finished == false) {
             message = "Wait for the current extraction to finish."
             return
         }
-        val kind = Archives.kind(f.name) ?: return
+        val names = list.map { it.name }.filter { Archives.kind(it) != null }
+        if (names.isEmpty()) return
+        val label = if (names.size == 1) names[0] else "${names.size} archives"
         prefs.intoFolder = intoFolder
         prefs.deleteAfter = deleteAfter
         val cfg = config
         val dir = path
         val into = intoFolder
         val delete = deleteAfter
-        job = JobState(f.name, dir, "")
+        job = JobState(label, dir, "")
         viewModelScope.launch {
             try {
                 // Connect first so we know the home folder.
                 ssh.list(cfg, dir)
                 val jobDir = ssh.home.trimEnd('/') + "/.whatbox-extractor/jobs/" + System.currentTimeMillis()
-                val script = Archives.buildScript(dir, f.name, kind, into, delete, jobDir)
+                val script = Archives.buildScript(dir, names, into, delete, jobDir)
                 ssh.exec(cfg, "mkdir -p ${shQuote(jobDir)}")
                 ssh.writeFile(cfg, "$jobDir/run.sh", script)
                 val start = ssh.exec(cfg, "cd ${shQuote(jobDir)} && nohup sh run.sh > log 2>&1 < /dev/null &")
                 if (start.code != 0) throw IllegalStateException(start.err.ifBlank { "Couldn't start extraction" })
-                prefs.activeJob = listOf(jobDir, dir, f.name).joinToString("\n")
+                prefs.activeJob = listOf(jobDir, dir, label).joinToString("\n")
                 job = job?.copy(jobDir = jobDir, status = "Extracting…")
                 poll()
             } catch (e: CancellationException) {

@@ -6,7 +6,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -30,11 +32,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -46,6 +50,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -123,6 +128,7 @@ fun App(vm: MainViewModel = viewModel()) {
     }
 
     vm.confirm?.let { ExtractDialog(vm, it) }
+    vm.pendingDelete?.let { DeleteDialog(vm, it) }
     if (vm.showExtractOptions) ExtractOptionsDialog(vm)
     if (vm.showNewFolder) NewFolderDialog(vm)
     vm.job?.let { if (!it.hidden) JobDialog(vm, it) }
@@ -135,11 +141,13 @@ fun App(vm: MainViewModel = viewModel()) {
 fun BrowserScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
     val path = vm.path
     val atTop = path.isEmpty() || path == "/"
+    val selecting = vm.selected.isNotEmpty()
     BackHandler(enabled = !atTop && path != vm.homePath) { vm.goUp() }
+    BackHandler(enabled = selecting) { vm.clearSelection() }
 
     Scaffold(
         topBar = {
-            TopAppBar(
+            if (selecting) SelectionBar(vm) else TopAppBar(
                 navigationIcon = {
                     if (!atTop) {
                         IconButton(onClick = { vm.goUp() }) {
@@ -175,7 +183,7 @@ fun BrowserScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
         },
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
-            if (vm.path.isNotEmpty() && vm.error == null) {
+            if (vm.path.isNotEmpty() && vm.error == null && !selecting) {
                 ExtendedFloatingActionButton(
                     onClick = { vm.showNewFolder = true },
                     icon = { Icon(Icons.Filled.Add, contentDescription = null) },
@@ -203,14 +211,29 @@ fun BrowserScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
             }
 
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
-                items(vm.files, key = { it.path }) { f -> FileRow(f) { vm.open(f) } }
+                items(vm.files, key = { it.path }) { f ->
+                    FileRow(
+                        f = f,
+                        selecting = selecting,
+                        selected = f.path in vm.selected,
+                        onClick = { vm.open(f) },
+                        onLongClick = { vm.toggleSelect(f) },
+                    )
+                }
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun FileRow(f: RemoteFile, onClick: () -> Unit) {
+fun FileRow(
+    f: RemoteFile,
+    selecting: Boolean,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     val kind = if (f.isDir) null else Archives.kind(f.name)
     val icon = when {
         f.isDir -> "📁"
@@ -219,8 +242,9 @@ fun FileRow(f: RemoteFile, onClick: () -> Unit) {
     }
     val sub = when {
         f.isDir -> "Folder"
+        selecting -> formatSize(f.size)
         kind != null -> "${formatSize(f.size)} · tap to extract"
-        else -> formatSize(f.size)
+        else -> "${formatSize(f.size)} · tap to delete"
     }
     ListItem(
         headlineContent = {
@@ -233,10 +257,100 @@ fun FileRow(f: RemoteFile, onClick: () -> Unit) {
             )
         },
         supportingContent = { Text(sub) },
-        leadingContent = { Text(icon, fontSize = 26.sp) },
-        modifier = Modifier.clickable(onClick = onClick),
+        leadingContent = {
+            if (selecting) {
+                Checkbox(checked = selected, onCheckedChange = { onClick() })
+            } else {
+                Text(icon, fontSize = 26.sp)
+            }
+        },
+        colors = ListItemDefaults.colors(
+            containerColor = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface,
+        ),
+        modifier = Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick),
     )
     HorizontalDivider()
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SelectionBar(vm: MainViewModel) {
+    val sel = vm.selectedFiles
+    val anyArchives = sel.any { !it.isDir && Archives.kind(it.name) != null }
+    TopAppBar(
+        colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        ),
+        navigationIcon = {
+            IconButton(onClick = { vm.clearSelection() }) { Icon(Icons.Filled.Close, "Cancel selection") }
+        },
+        title = { Text("${sel.size} selected") },
+        actions = {
+            TextButton(onClick = { vm.selectAll() }) {
+                Text(if (vm.selected.size == vm.files.size) "None" else "All")
+            }
+            if (anyArchives) {
+                TextButton(onClick = { vm.extractSelected() }) { Text("Extract") }
+            }
+            IconButton(onClick = { vm.deleteSelected() }) { Icon(Icons.Filled.Delete, "Delete selected") }
+        },
+    )
+}
+
+@Composable
+fun DeleteDialog(vm: MainViewModel, items: List<RemoteFile>) {
+    val folders = items.count { it.isDir }
+    AlertDialog(
+        onDismissRequest = { if (!vm.deleting) vm.pendingDelete = null },
+        title = {
+            Text(
+                when {
+                    items.size > 1 -> "Delete ${items.size} items?"
+                    folders == 1 -> "Delete folder?"
+                    else -> "Delete file?"
+                },
+            )
+        },
+        text = {
+            Column {
+                items.take(6).forEach { f ->
+                    Text(
+                        (if (f.isDir) "📁 " else "📄 ") + f.name,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                if (items.size > 6) Text("…and ${items.size - 6} more")
+                Spacer(Modifier.size(8.dp))
+                if (folders > 0) {
+                    Text(
+                        "Folders are deleted with everything inside them.",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Text("This can't be undone.", style = MaterialTheme.typography.bodySmall)
+                if (vm.deleting) {
+                    Spacer(Modifier.size(8.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { vm.confirmDelete() },
+                enabled = !vm.deleting,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+            ) { Text("Delete") }
+        },
+        dismissButton = {
+            TextButton(onClick = { vm.pendingDelete = null }, enabled = !vm.deleting) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable
@@ -387,25 +501,39 @@ fun NewFolderDialog(vm: MainViewModel) {
 }
 
 @Composable
-fun ExtractDialog(vm: MainViewModel, f: RemoteFile) {
+fun ExtractDialog(vm: MainViewModel, list: List<RemoteFile>) {
+    val single = list.singleOrNull()
     AlertDialog(
         onDismissRequest = { vm.confirm = null },
-        title = { Text("Extract archive?") },
+        title = { Text(if (single != null) "Extract archive?" else "Extract ${list.size} archives?") },
         text = {
             Column {
-                Text(f.name, fontWeight = FontWeight.SemiBold)
+                list.take(6).forEach { Text(it.name, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                if (list.size > 6) Text("…and ${list.size - 6} more")
                 Spacer(Modifier.size(4.dp))
                 Text(
                     "Extraction runs on your Whatbox, so it keeps going even if you close the app.",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Spacer(Modifier.size(8.dp))
-                CheckRow("Put files in a new folder \"${Archives.stem(f.name)}\"", vm.intoFolder) { vm.intoFolder = it }
+                val folderLabel = if (single != null) "Put files in a new folder \"${Archives.stem(single.name)}\""
+                else "Put each archive's files in its own new folder"
+                CheckRow(folderLabel, vm.intoFolder) { vm.intoFolder = it }
                 CheckRow("Delete the archive after it extracts successfully", vm.deleteAfter) { vm.deleteAfter = it }
             }
         },
-        confirmButton = { Button(onClick = { vm.startExtract(f) }) { Text("Extract") } },
-        dismissButton = { TextButton(onClick = { vm.confirm = null }) { Text("Cancel") } },
+        confirmButton = { Button(onClick = { vm.startExtract(list) }) { Text("Extract") } },
+        dismissButton = {
+            Row {
+                if (single != null) {
+                    TextButton(onClick = {
+                        vm.confirm = null
+                        vm.pendingDelete = list
+                    }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                }
+                TextButton(onClick = { vm.confirm = null }) { Text("Cancel") }
+            }
+        },
     )
 }
 
