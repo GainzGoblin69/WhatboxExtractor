@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -142,12 +143,13 @@ fun BrowserScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
     val path = vm.path
     val atTop = path.isEmpty() || path == "/"
     val selecting = vm.selected.isNotEmpty()
-    BackHandler(enabled = !atTop && path != vm.homePath) { vm.goUp() }
+    // Back goes up a folder (selection is kept); at the top it clears the selection.
     BackHandler(enabled = selecting) { vm.clearSelection() }
+    BackHandler(enabled = !atTop && path != vm.homePath) { vm.goUp() }
 
     Scaffold(
         topBar = {
-            if (selecting) SelectionBar(vm) else TopAppBar(
+            TopAppBar(
                 navigationIcon = {
                     if (!atTop) {
                         IconButton(onClick = { vm.goUp() }) {
@@ -182,6 +184,7 @@ fun BrowserScreen(vm: MainViewModel, snackbar: SnackbarHostState) {
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },
+        bottomBar = { if (selecting) SelectionBottomBar(vm) },
         floatingActionButton = {
             if (vm.path.isNotEmpty() && vm.error == null && !selecting) {
                 ExtendedFloatingActionButton(
@@ -241,6 +244,7 @@ fun FileRow(
         else -> "📄"
     }
     val sub = when {
+        f.isDir && selecting -> "Folder · tap to open"
         f.isDir -> "Folder"
         selecting -> formatSize(f.size)
         kind != null -> "${formatSize(f.size)} · tap to extract"
@@ -259,7 +263,7 @@ fun FileRow(
         supportingContent = { Text(sub) },
         leadingContent = {
             if (selecting) {
-                Checkbox(checked = selected, onCheckedChange = { onClick() })
+                Checkbox(checked = selected, onCheckedChange = { onLongClick() })
             } else {
                 Text(icon, fontSize = 26.sp)
             }
@@ -272,29 +276,62 @@ fun FileRow(
     HorizontalDivider()
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/** Shown while items are selected. Selection stays while you browse, so you can move things. */
 @Composable
-fun SelectionBar(vm: MainViewModel) {
+fun SelectionBottomBar(vm: MainViewModel) {
     val sel = vm.selectedFiles
-    val anyArchives = sel.any { !it.isDir && Archives.kind(it.name) != null }
-    TopAppBar(
-        colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-            containerColor = MaterialTheme.colorScheme.secondaryContainer,
-        ),
-        navigationIcon = {
-            IconButton(onClick = { vm.clearSelection() }) { Icon(Icons.Filled.Close, "Cancel selection") }
-        },
-        title = { Text("${sel.size} selected") },
-        actions = {
-            TextButton(onClick = { vm.selectAll() }) {
-                Text(if (vm.selected.size == vm.files.size) "None" else "All")
+    val here = vm.movableHere
+    val extractable = sel.any { !it.isDir && Archives.kind(it.name) != null && parentOf(it.path) == vm.path }
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        tonalElevation = 3.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            Modifier
+                .navigationBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { vm.clearSelection() }) { Icon(Icons.Filled.Close, "Clear selection") }
+                Text(
+                    "${sel.size} selected",
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { vm.selectAll() }, enabled = vm.files.isNotEmpty()) {
+                    Text(if (vm.allHereSelected) "Unselect here" else "Select all here")
+                }
             }
-            if (anyArchives) {
-                TextButton(onClick = { vm.extractSelected() }) { Text("Extract") }
+            if (sel.isNotEmpty() && here.isEmpty()) {
+                Text(
+                    "Open another folder, then tap Move here.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 12.dp, bottom = 4.dp),
+                )
             }
-            IconButton(onClick = { vm.deleteSelected() }) { Icon(Icons.Filled.Delete, "Delete selected") }
-        },
-    )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = { vm.deleteSelected() }, enabled = !vm.moving) {
+                    Icon(Icons.Filled.Delete, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Delete")
+                }
+                if (extractable) {
+                    OutlinedButton(onClick = { vm.extractSelected() }, enabled = !vm.moving) { Text("Extract") }
+                }
+                Spacer(Modifier.weight(1f))
+                Button(onClick = { vm.moveHere() }, enabled = here.isNotEmpty() && !vm.moving) {
+                    if (vm.moving) {
+                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Moving…")
+                    } else {
+                        Text(if (here.size == sel.size || here.isEmpty()) "Move here" else "Move ${here.size} here")
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable

@@ -59,7 +59,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var lookupJob: Job? = null
     var deleting by mutableStateOf(false)
         private set
-    var selected by mutableStateOf<Set<String>>(emptySet())
+    /** Selected items by path. Kept while browsing other folders so they can be moved. */
+    var selected by mutableStateOf<Map<String, RemoteFile>>(emptyMap())
+        private set
+    var moving by mutableStateOf(false)
         private set
     var job by mutableStateOf<JobState?>(null)
         private set
@@ -92,7 +95,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun load(target: String) {
         val cfg = config
         loadJob?.cancel()
-        selected = emptySet()
         loadJob = viewModelScope.launch {
             loading = true
             error = null
@@ -120,8 +122,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun open(f: RemoteFile) {
         when {
-            selected.isNotEmpty() -> toggleSelect(f)
             f.isDir -> load(f.path)
+            selected.isNotEmpty() -> toggleSelect(f)
             Archives.kind(f.name) != null -> confirm = listOf(f)
             else -> requestDelete(listOf(f))
         }
@@ -130,24 +132,35 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ---------- Selection & delete ----------
 
     val selectedFiles: List<RemoteFile>
-        get() = files.filter { it.path in selected }
+        get() = selected.values.toList()
+
+    val allHereSelected: Boolean
+        get() = files.isNotEmpty() && files.all { it.path in selected }
+
+    /** Selected items that can be moved into the folder being viewed. */
+    val movableHere: List<RemoteFile>
+        get() = selected.values.filter { canMoveInto(it, path) }
+
+    private fun canMoveInto(f: RemoteFile, dest: String): Boolean =
+        dest.isNotEmpty() && parentOf(f.path) != dest && dest != f.path && !dest.startsWith(f.path + "/")
 
     fun toggleSelect(f: RemoteFile) {
-        selected = if (f.path in selected) selected - f.path else selected + f.path
+        selected = if (f.path in selected) selected - f.path else selected + (f.path to f)
     }
 
     fun selectAll() {
-        selected = if (selected.size == files.size) emptySet() else files.map { it.path }.toSet()
+        selected = if (allHereSelected) selected - files.map { it.path }.toSet()
+        else selected + files.associateBy { it.path }
     }
 
     fun clearSelection() {
-        selected = emptySet()
+        selected = emptyMap()
     }
 
     fun extractSelected() {
-        val archives = selectedFiles.filter { !it.isDir && Archives.kind(it.name) != null }
+        val archives = selectedFiles.filter { !it.isDir && Archives.kind(it.name) != null && parentOf(it.path) == path }
         if (archives.isEmpty()) {
-            message = "None of the selected items are .zip, .rar or .7z archives."
+            message = "Open the folder with the selected archives to extract them."
             return
         }
         confirm = archives
@@ -197,8 +210,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             deleting = true
             try {
-                // Only delete things directly inside the folder being viewed.
-                val targets = items.filter { it.path.startsWith(dir.trimEnd('/') + "/") && it.path != dir }
+                // Never delete the root or home folder itself.
+                val home = ssh.home.trimEnd('/')
+                val targets = items.filter { it.path.count { c -> c == '/' } >= 2 && it.path.trimEnd('/') != home }
                 if (targets.isEmpty()) return@launch
                 var torrentNote = ""
                 val torrents = torrentMatches
@@ -232,7 +246,84 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             } finally {
                 deleting = false
                 pendingDelete = null
+                selected = selected - items.map { it.path }.toSet()
                 if (path == dir) load(dir)
+            }
+        }
+    }
+
+    fun moveHere() {
+        val dest = path
+        val all = movableHere
+        if (all.isEmpty() || moving) return
+        val existing = files.map { it.name }.toSet()
+        val conflicts = all.filter { it.name in existing }
+        val items = all.filter { it.name !in existing }
+        if (items.isEmpty()) {
+            message = "Something with the same name is already in this folder."
+            return
+        }
+        val cfg = config
+        viewModelScope.launch {
+            moving = true
+            try {
+                // Find torrents seeding these files so rTorrent can be pointed at the new location.
+                val home = ssh.home
+                var torrents: List<TorrentMatch> = emptyList()
+                try {
+                    ssh.exec(cfg, "mkdir -p ${shQuote(home.trimEnd('/') + "/.whatbox-extractor")}")
+                    ssh.writeFile(cfg, Torrents.helperPath(home), Torrents.HELPER_SCRIPT)
+                    val r = ssh.exec(cfg, Torrents.findCommand(home, items.map { it.path }))
+                    torrents = Torrents.parse(r.out, r.err)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                }
+
+                val cmd = "mv -n -- " + items.joinToString(" ") { shQuote(it.path) } + " " + shQuote(dest.trimEnd('/') + "/")
+                val r = ssh.exec(cfg, cmd)
+                if (r.code != 0) throw IllegalStateException(r.err.trim().ifBlank { "mv failed (code ${r.code})" })
+
+                var torrentNote = ""
+                val moves = torrents.mapNotNull { t ->
+                    val item = items.firstOrNull { t.path == it.path || t.path.startsWith(it.path + "/") }
+                        ?: return@mapNotNull null
+                    t.hash to (dest.trimEnd('/') + "/" + item.name + t.path.removePrefix(item.path))
+                }
+                if (moves.isNotEmpty()) {
+                    try {
+                        val rr = ssh.exec(cfg, Torrents.relocateCommand(home, moves))
+                        Torrents.parse(rr.out, rr.err)
+                        torrentNote = if (moves.size == 1) " (rTorrent updated to keep seeding)" else " (${moves.size} torrents updated to keep seeding)"
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        torrentNote = " (couldn't update rTorrent: ${e.message})"
+                    }
+                }
+
+                // Keep favorites pointing at moved folders.
+                val favs = favorites
+                val updatedFavs = favs.map { fav ->
+                    val item = items.firstOrNull { fav == it.path || fav.startsWith(it.path + "/") }
+                    if (item == null) fav else dest.trimEnd('/') + "/" + item.name + fav.removePrefix(item.path)
+                }
+                if (updatedFavs != favs) {
+                    favorites = updatedFavs
+                    prefs.favorites = updatedFavs
+                }
+
+                selected = selected - items.map { it.path }.toSet()
+                val moved = if (items.size == 1) "Moved ${items[0].name}" else "Moved ${items.size} items"
+                val skipped = if (conflicts.isEmpty()) "" else ", skipped ${conflicts.size} (name already here)"
+                message = moved + skipped + torrentNote
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                message = "Move failed: ${friendlyError(e)}"
+            } finally {
+                moving = false
+                if (path == dest) load(dest)
             }
         }
     }
@@ -479,3 +570,5 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Don't block; the connection is dropped with the process anyway.
     }
 }
+
+fun parentOf(p: String): String = p.trimEnd('/').substringBeforeLast('/').ifEmpty { "/" }

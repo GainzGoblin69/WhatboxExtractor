@@ -18,6 +18,11 @@ object Torrents {
     fun removeCommand(home: String, hashes: List<String>) =
         "python3 -I ${shQuote(helperPath(home))} remove " + hashes.joinToString(" ") { shQuote(it) }
 
+    /** pairs of (hash, new data path) */
+    fun relocateCommand(home: String, moves: List<Pair<String, String>>) =
+        "python3 -I ${shQuote(helperPath(home))} relocate " +
+            moves.joinToString(" ") { shQuote(it.first) + " " + shQuote(it.second) }
+
     /** Parses the helper's JSON output. Throws with a readable message on failure. */
     fun parse(out: String, err: String): List<TorrentMatch> {
         val line = out.lines().lastOrNull { it.trim().startsWith("{") }
@@ -149,6 +154,30 @@ def remove(sock, hashes):
     return done
 
 
+def relocate(sock, args):
+    done = []
+    for i in range(0, len(args) - 1, 2):
+        h, new_path = args[i], args[i + 1]
+        try:
+            active = call(sock, "d.is_active", h)
+        except Exception:
+            active = 0
+        multi = call(sock, "d.is_multi_file", h)
+        for m in ("d.stop", "d.close"):
+            try:
+                call(sock, m, h)
+            except Exception:
+                pass
+        if multi:
+            call(sock, "d.directory_base.set", h, new_path)
+        else:
+            call(sock, "d.directory.set", h, os.path.dirname(new_path))
+        if active:
+            call(sock, "d.start", h)
+        done.append({"hash": h, "name": "", "path": new_path})
+    return done
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps({"ok": False, "error": "usage"}))
@@ -160,6 +189,8 @@ def main():
     try:
         if sys.argv[1] == "find":
             out = find(sock, sys.argv[2:])
+        elif sys.argv[1] == "relocate":
+            out = relocate(sock, sys.argv[2:])
         elif sys.argv[1] == "remove":
             out = remove(sock, sys.argv[2:])
         else:
